@@ -7,7 +7,6 @@
 #include "updates.h"
 #include "speeduino.h"
 #include "timers.h"
-#include "comms.h"
 #include "comms_secondary.h"
 #include "comms_CAN.h"
 #include "utilities.h"
@@ -28,12 +27,6 @@
 #ifdef SD_LOGGING
   #include "SD_logger.h"
   #include "rtc_common.h"
-#endif
-
-#if defined(CORE_AVR)
-#pragma GCC push_options
-// This minimizes RAM usage at no performance cost
-#pragma GCC optimize ("Os") 
 #endif
 
 #if !defined(UNIT_TEST)
@@ -111,7 +104,7 @@ void initialiseAll(void)
     ***********************************************************************************************************
     * EEPROM reset
     */
-    #if defined(EEPROM_RESET_PIN) && !defined(UNIT_TEST)
+    #if defined(EEPROM_RESET_PIN)
     uint32_t start_time = millis();
     byte exit_erase_loop = false; 
     pinMode(EEPROM_RESET_PIN, INPUT_PULLUP);  
@@ -159,16 +152,10 @@ void initialiseAll(void)
     
   #ifdef SD_LOGGING
     initRTC();
-    if(configPage13.onboard_log_file_style) { initSD(); }
+    initSD();
   #endif
 
-//Teensy 4.1 does not require .begin() to be called. This introduces a 700ms delay on startup time whilst USB is enumerated if it is called
-#ifndef CORE_TEENSY41
     Serial.begin(115200);
-    #else
-    teensy41_customSerialBegin();
-#endif
-    pPrimarySerial = &Serial; //Default to standard Serial interface
     BIT_SET(currentStatus.status4, BIT_STATUS4_ALLOW_LEGACY_COMMS); //Flag legacy comms as being allowed on startup
 
     //Repoint the 2D table structs to the config pages that were just loaded
@@ -186,9 +173,7 @@ void initialiseAll(void)
     }
     else { setPinMapping(configPage2.pinMapping); }
 
-    // Repeatedly initialising the CAN bus hangs the system when
-    // running initialisation tests on Teensy 3.5
-    #if defined(NATIVE_CAN_AVAILABLE) && !defined(UNIT_TEST)
+    #if defined(NATIVE_CAN_AVAILABLE)
       initCAN();
     #endif
 
@@ -241,19 +226,18 @@ void initialiseAll(void)
     initialiseCorrections();
     BIT_CLEAR(currentStatus.engineProtectStatus, PROTECT_IO_ERROR); //Clear the I/O error bit. The bit will be set in initialiseADC() if there is problem in there.
     initialiseADC();
-    initialiseMAPBaro();
     initialiseProgrammableIO();
 
     //Check whether the flex sensor is enabled and if so, attach an interrupt for it
     if(configPage2.flexEnabled > 0)
     {
-      if(!pinIsReserved(pinFlex)) { attachInterrupt(digitalPinToInterrupt(pinFlex), flexPulse, CHANGE); }
+      attachInterrupt(digitalPinToInterrupt(pinFlex), flexPulse, CHANGE);
       currentStatus.ethanolPct = 0;
     }
     //Same as above, but for the VSS input
     if(configPage2.vssMode > 1) // VSS modes 2 and 3 are interrupt drive (Mode 1 is CAN)
     {
-      if(!pinIsReserved(pinVSS)) { attachInterrupt(digitalPinToInterrupt(pinVSS), vssPulse, RISING); }
+      attachInterrupt(digitalPinToInterrupt(pinVSS), vssPulse, RISING);
     }
     //As above but for knock pulses
     if(configPage10.knock_mode == KNOCK_MODE_DIGITAL)
@@ -261,11 +245,8 @@ void initialiseAll(void)
       if(configPage10.knock_pullup) { pinMode(configPage10.knock_pin, INPUT_PULLUP); }
       else { pinMode(configPage10.knock_pin, INPUT); }
 
-      if(!pinIsReserved(configPage10.knock_pin)) 
-      { 
-        if(configPage10.knock_trigger == KNOCK_TRIGGER_HIGH) { attachInterrupt(digitalPinToInterrupt(configPage10.knock_pin), knockPulse, RISING); }
-        else { attachInterrupt(digitalPinToInterrupt(configPage10.knock_pin), knockPulse, FALLING); }
-      }
+      if(configPage10.knock_trigger == KNOCK_TRIGGER_HIGH) { attachInterrupt(digitalPinToInterrupt(configPage10.knock_pin), knockPulse, RISING); }
+      else { attachInterrupt(digitalPinToInterrupt(configPage10.knock_pin), knockPulse, FALLING); }
     }
 
     //Once the configs have been loaded, a number of one time calculations can be completed
@@ -318,7 +299,11 @@ void initialiseAll(void)
     fixedCrankingOverride = 0;
     timer5_overflow_count = 0;
     toothHistoryIndex = 0;
-    resetDecoder();
+    toothLastToothTime = 0;
+
+    //Lookup the current MAP reading for barometric pressure
+    instanteneousMAPReading();
+    readBaro();
     
     noInterrupts();
     initialiseTriggers();
@@ -2089,7 +2074,7 @@ void setPinMapping(byte boardID)
       pinIdle2 = 14; //2 wire idle control PLACEHOLDER value for now
       pinFuelPump = 3; //Fuel pump output
       pinVVT_1 = 15; //Default VVT output PLACEHOLDER value for now
-      pinBoost = 5; //Boost control
+      pinBoost = 13; //Boost control
       pinSpareLOut1 = 49; //enable Wideband Lambda Heater
       pinSpareLOut2 = 16; //low current output spare2 PLACEHOLDER value for now
       pinSpareLOut3 = 17; //low current output spare3 PLACEHOLDER value for now
@@ -2342,7 +2327,7 @@ void setPinMapping(byte boardID)
         pinTrigger2 = 21; //The Cam Sensor pin
 
         pinFuelPump = 5; //Fuel pump output
-        pinTachOut = 0; //Tacho output pin
+        pinTachOut = 8; //Tacho output pin
 
         pinResetControl = 49; //PLaceholder only. Cannot use 42-47 as these are the SD card
 
@@ -3604,7 +3589,31 @@ void initialiseTriggers(void)
       
       attachInterrupt(triggerInterrupt, triggerHandler, primaryTriggerEdge);
       break;
+	  
+    case DECODER_JEEP1990S4CYL:
+      triggerSetup_JEEP1990S4CYL();
+      triggerHandler = triggerPri_JEEP1990S4CYL;
+      triggerSecondaryHandler = triggerSec_JEEP1990S4CYL;
+      getRPM = getRPM_JEEP1990S4CYL;
+      getCrankAngle = getCrankAngle_JEEP1990S4CYL;
+      triggerSetEndTeeth = triggerSetEndTeeth_JEEP1990S4CYL;
+	  
+      if(configPage4.TrigEdge == 0) { primaryTriggerEdge = RISING; } // Attach the crank trigger wheel interrupt (Hall sensor drags to ground when triggering)
+      else { primaryTriggerEdge = FALLING; }
+      secondaryTriggerEdge = RISING;
 
+      attachInterrupt(triggerInterrupt, triggerHandler, primaryTriggerEdge);
+      attachInterrupt(triggerInterrupt2, triggerSecondaryHandler, secondaryTriggerEdge);
+      break;
+
+    default:
+      triggerHandler = triggerPri_missingTooth;
+      getRPM = getRPM_missingTooth;
+      getCrankAngle = getCrankAngle_missingTooth;
+
+      if(configPage4.TrigEdge == 0) { attachInterrupt(triggerInterrupt, triggerHandler, RISING); } // Attach the crank trigger wheel interrupt (Hall sensor drags to ground when triggering)
+      else { attachInterrupt(triggerInterrupt, triggerHandler, FALLING); }
+      break;
 
     default:
       triggerHandler = triggerPri_missingTooth;
@@ -3856,7 +3865,3 @@ void changeFullToHalfSync(void)
     }
   }
 }
-
-#if defined(CORE_AVR)
-#pragma GCC pop_options
-#endif

@@ -38,9 +38,10 @@
 #define DECODER_NGC               22
 #define DECODER_VMAX              23
 #define DECODER_RENIX             24
-#define DECODER_ROVERMEMS		      25
+#define DECODER_ROVERMEMS         25
 #define DECODER_SUZUKI_K6A        26
 #define DECODER_HONDA_J32         27
+#define DECODER_JEEP1990S4CYL     28
 
 #define BIT_DECODER_2ND_DERIV           0 //The use of the 2nd derivative calculation is limited to certain decoders. This is set to either true or false in each decoders setup routine
 #define BIT_DECODER_IS_SEQUENTIAL       1 //Whether or not the decoder supports sequential operation
@@ -50,24 +51,8 @@
 #define BIT_DECODER_VALID_TRIGGER       5 //Is set true when the last trigger (Primary or secondary) was valid (ie passed filters)
 #define BIT_DECODER_TOOTH_ANG_CORRECT   6 //Whether or not the triggerToothAngle variable is currently accurate. Some patterns have times when the triggerToothAngle variable cannot be accurately set.
 
-#define TRIGGER_FILTER_OFF              0
-#define TRIGGER_FILTER_LITE             1
-#define TRIGGER_FILTER_MEDIUM           2
-#define TRIGGER_FILTER_AGGRESSIVE       3
-
 //220 bytes free
 extern volatile uint8_t decoderState;
-
-/**
- * @brief Is the engine running?
- * 
- * This is based on whether or not the decoder has detected a tooth recently
- * 
- * @param curTime The time in µS to use for the liveness check. Typically the result of a recent call to micros() 
- * @return true If the engine is turning
- * @return false If the engine is not turning
- */
-bool engineIsRunning(uint32_t curTime);
 
 /*
 extern volatile bool validTrigger; //Is set true when the last trigger (Primary or secondary) was valid (ie passed filters)
@@ -77,6 +62,9 @@ extern bool decoderIsSequential; //Whether or not the decoder supports sequentia
 extern bool decoderHasSecondary; //Whether or not the pattern uses a secondary input
 extern bool decoderHasFixedCrankingTiming; 
 */
+
+//This isn't to to filter out wrong pulses on triggers, but just to smooth out the cam angle reading for better closed loop VVT control.
+#define ANGLE_FILTER(input, alpha, prior) (((long)(input) * (256 - (alpha)) + ((long)(prior) * (alpha)))) >> 8
 
 void loggerPrimaryISR(void);
 void loggerSecondaryISR(void);
@@ -270,12 +258,12 @@ uint16_t getRPM_SuzukiK6A(void);
 int getCrankAngle_SuzukiK6A(void);
 void triggerSetEndTeeth_SuzukiK6A(void);
 
-/**
- * @brief This function is called when the engine is stopped, or when the engine is started. It resets the decoder state and the tooth tracking variables
- *
- * @return void
- */
-void resetDecoder(void);
+void triggerSetup_JEEP1990S4CYL(void);
+void triggerPri_JEEP1990S4CYL(void);
+void triggerSec_JEEP1990S4CYL(void);
+uint16_t getRPM_JEEP1990S4CYL(void);
+int getCrankAngle_JEEP1990S4CYL(void);
+void triggerSetEndTeeth_JEEP1990S4CYL(void);
 
 extern void (*triggerHandler)(void); //Pointer for the trigger function (Gets pointed to the relevant decoder)
 extern void (*triggerSecondaryHandler)(void); //Pointer for the secondary trigger function (Gets pointed to the relevant decoder)
@@ -292,8 +280,12 @@ extern volatile unsigned long curGap2;
 extern volatile unsigned long lastGap;
 extern volatile unsigned long targetGap;
 
+extern unsigned long MAX_STALL_TIME; //The maximum time (in uS) that the system will continue to function before the engine is considered stalled/stopped. This is unique to each decoder, depending on the number of teeth etc. 500000 (half a second) is used as the default value, most decoders will be much less.
 extern volatile uint16_t toothCurrentCount; //The current number of teeth (Once sync has been achieved, this can never actually be 0
+extern volatile byte toothSystemCount; //Used for decoders such as Audi 135 where not every tooth is used for calculating crank angle. This variable stores the actual number of teeth, not the number being used to calculate crank angle
 extern volatile unsigned long toothSystemLastToothTime; //As below, but used for decoders where not every tooth count is used for calculation
+extern volatile unsigned long toothLastToothTime; //The time (micros()) that the last tooth was registered
+extern volatile unsigned long toothLastSecToothTime; //The time (micros()) that the last tooth was registered on the secondary input
 extern volatile unsigned long toothLastThirdToothTime; //The time (micros()) that the last tooth was registered on the second cam input
 extern volatile unsigned long toothLastMinusOneToothTime; //The time (micros()) that the tooth before the last tooth was registered
 extern volatile unsigned long toothLastMinusOneSecToothTime; //The time (micros()) that the tooth before the last tooth was registered on secondary input
@@ -303,6 +295,7 @@ extern volatile unsigned long toothOneTime; //The time (micros()) that tooth 1 l
 extern volatile unsigned long toothOneMinusOneTime; //The 2nd to last time (micros()) that tooth 1 last triggered
 extern volatile bool revolutionOne; // For sequential operation, this tracks whether the current revolution is 1 or 2 (not 1)
 
+extern volatile unsigned int secondaryToothCount; //Used for identifying the current secondary (Usually cam) tooth for patterns with multiple secondary teeth
 extern volatile unsigned long secondaryLastToothTime; //The time (micros()) that the last tooth was registered (Cam input)
 extern volatile unsigned long secondaryLastToothTime1; //The time (micros()) that the last tooth was registered (Cam input)
 
